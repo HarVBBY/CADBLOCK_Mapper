@@ -2,7 +2,6 @@ import { useState, useRef, useMemo, useEffect } from "react";
 
 // ── Shared constants ──────────────────────────────────────────────────────────
 const BB_STEPS  = ["Upload", "Clean", "Configure", "Attributes", "Generate"];
-const ODN_STEPS = ["Upload", "Clean", "Configure", "Attributes", "Generate"];
 const OPERATORS = ["=", "!=", ">", "<", ">=", "<=", "contains", "starts with", "ends with"];
 
 
@@ -117,10 +116,12 @@ function generateLISP(cleanData, xCol, yCol, ruleGroups, fallback, attrMaps, use
 
     const attrDefs = attrMaps[blockName] || [];
     const attrPairs = attrDefs
-      .filter(a => a.tag.trim() !== "" && a.col !== "")
+      .filter(a => a.tag.trim() !== "" && (a.col !== "" || a.fixedVal !== undefined))
       .map(a => {
-        const raw = row[a.col] ?? "";
-        const val = resolveAttrValue(raw, a.transforms);
+        // fixedVal always wins — used for hardcoded attributes like LCPNAP NAP# = N01
+        const val = a.fixedVal !== undefined
+          ? String(a.fixedVal).toUpperCase()
+          : resolveAttrValue(row[a.col] ?? "", a.transforms);
         return `"${a.tag.toUpperCase()}" "${val.replace(/"/g, '\\"')}"`;
       });
 
@@ -906,6 +907,631 @@ function Plotter({
   );
 }
 
+
+// ── ODN Block/Attr constants ──────────────────────────────────────────────────
+const ODN_BLOCKS    = ["MPOLE", "CLOSURE", "NAP16", "LCPNAP"];
+const ODN_ATTR_DEFS = {
+  MPOLE:   [{ tag: "POLETAG",  colHint: "TEXT_CONTENT" }],
+  NAP16:   [{ tag: "NAPID",    colHint: "TEXT_CONTENT" }, { tag: "NAP#",  colHint: "NODE_ID" }],
+  LCPNAP:  [{ tag: "LCPID",    colHint: "TEXT_CONTENT" }, { tag: "NAPID", colHint: "TEXT_CONTENT" }, { tag: "NAP#", fixedVal: "N01" }],
+  CLOSURE: [],
+};
+
+// Auto-assign block based on feature name and folder name
+function autoAssignBlock(name, folder) {
+  const n = (name  || "").toUpperCase();
+  const f = (folder|| "").toUpperCase();
+  if (n.includes("POI"))  return "CLOSURE";
+  if (f.includes("NAP"))  return "NAP16";
+  if (f.includes("LCP"))  return "LCPNAP";
+  if (f.includes("POLE")) return "MPOLE";
+  return "";
+}
+
+// ── KMZ parser ────────────────────────────────────────────────────────────────
+async function readZipEntry(zipBytes, fileName) {
+  // Minimal ZIP parser — finds a file by name and returns its raw bytes
+  // KMZ files are standard ZIP format
+  const view = new DataView(zipBytes);
+  const bytes = new Uint8Array(zipBytes);
+  let offset = 0;
+  while (offset < bytes.length - 4) {
+    // Local file header signature = 0x04034b50
+    if (view.getUint32(offset, true) !== 0x04034b50) break;
+    const compression  = view.getUint16(offset + 8,  true);
+    const compSize     = view.getUint32(offset + 18, true);
+    const uncompSize   = view.getUint32(offset + 22, true);
+    const nameLen      = view.getUint16(offset + 26, true);
+    const extraLen     = view.getUint16(offset + 28, true);
+    const entryName    = new TextDecoder().decode(bytes.slice(offset + 30, offset + 30 + nameLen));
+    const dataStart    = offset + 30 + nameLen + extraLen;
+    const compData     = bytes.slice(dataStart, dataStart + compSize);
+    if (entryName === fileName || entryName.endsWith("/" + fileName) || entryName.endsWith(".kml")) {
+      if (compression === 0) {
+        // Stored (no compression)
+        return new TextDecoder("utf-8").decode(compData);
+      } else if (compression === 8) {
+        // Deflate — use DecompressionStream
+        const ds     = new DecompressionStream("deflate-raw");
+        const writer = ds.writable.getWriter();
+        const reader = ds.readable.getReader();
+        writer.write(compData);
+        writer.close();
+        const chunks = [];
+        let done = false;
+        while (!done) {
+          const { value, done: d } = await reader.read();
+          if (value) chunks.push(value);
+          done = d;
+        }
+        const total  = chunks.reduce((s, c) => s + c.length, 0);
+        const result = new Uint8Array(total);
+        let pos = 0;
+        for (const chunk of chunks) { result.set(chunk, pos); pos += chunk.length; }
+        return new TextDecoder("utf-8").decode(result);
+      }
+    }
+    offset = dataStart + compSize;
+  }
+  throw new Error("No .kml file found inside KMZ");
+}
+
+async function parseKMZ(file) {
+  // Read KMZ as ArrayBuffer, extract KML, parse points
+  const arrayBuffer = await file.arrayBuffer();
+  const kmlText     = await readZipEntry(arrayBuffer, "doc.kml");
+  const parser      = new DOMParser();
+  const doc         = parser.parseFromString(kmlText, "text/xml");
+
+  // Folder name lookup: walk up DOM to find parent Folder name
+  const getFolderName = (pmEl) => {
+    let node = pmEl.parentElement;
+    while (node) {
+      if (node.tagName === "Folder" || node.localName === "Folder") {
+        const nameEl = node.querySelector(":scope > name");
+        if (nameEl) return nameEl.textContent.trim();
+      }
+      node = node.parentElement;
+    }
+    return "";
+  };
+
+  const rows = [];
+  const ns   = "http://www.opengis.net/kml/2.2";
+  const pms  = [...doc.getElementsByTagNameNS(ns, "Placemark")];
+
+  pms.forEach(pm => {
+    const nameEl  = pm.getElementsByTagNameNS(ns, "name")[0];
+    const name    = nameEl ? nameEl.textContent.trim() : "";
+    const pointEl = pm.getElementsByTagNameNS(ns, "Point")[0];
+    if (!pointEl) return;
+    const coordEl = pointEl.getElementsByTagNameNS(ns, "coordinates")[0];
+    if (!coordEl) return;
+    const parts = coordEl.textContent.trim().split(",");
+    const lon   = parseFloat(parts[0]);
+    const lat   = parseFloat(parts[1]);
+    if (isNaN(lon) || isNaN(lat)) return;
+    const folder = getFolderName(pm);
+    rows.push({ TEXT_CONTENT: name, LONGITUDE: String(lon), LATITUDE: String(lat), FOLDER: folder });
+  });
+
+  if (rows.length === 0) throw new Error("No point features found in KMZ");
+  return rows;
+}
+
+// ── ODN Plotter component ─────────────────────────────────────────────────────
+function ODNPlotter({ accentColor }) {
+  const ODN_STEPS_LOCAL = ["Upload", "Clean", "Configure", "Attributes", "Generate"];
+  const [step, setStep]                   = useState(0);
+  const [rawData, setRawData]             = useState([]);
+  const [cleanData, setCleanData]         = useState([]);
+  const [remapCols, setRemapCols]         = useState([]);
+  const [remapRules, setRemapRules]       = useState({});
+  const [expandedRemapCol, setExpandedRemapCol] = useState(null);
+  const [splitRules, setSplitRules]       = useState([]);
+  const [ruleGroups, setRuleGroups]       = useState([newGroup()]);
+  const [fallback, setFallback]           = useState("MPOLE");
+  const [attrMaps, setAttrMaps]           = useState({});
+  const [expandedAttrBlock, setExpandedAttrBlock]         = useState(null);
+  const [expandedAttrTransform, setExpandedAttrTransform] = useState(null);
+  const [scriptOutput, setScriptOutput]   = useState("");
+  const [dragOver, setDragOver]           = useState(false);
+  const [stats, setStats]                 = useState(null);
+  const [parseError, setParseError]       = useState("");
+  const [loading, setLoading]             = useState(false);
+  const initializedBlocks                 = useRef(new Set());
+  const fileRef                           = useRef();
+  const ac = accentColor;
+
+  const HEADERS = ["TEXT_CONTENT", "LONGITUDE", "LATITUDE", "FOLDER"];
+
+  // ── KMZ upload ──
+  const handleFile = async (file) => {
+    if (!file) return;
+    setLoading(true); setParseError("");
+    try {
+      const rows = await parseKMZ(file);
+      if (rows.length === 0) throw new Error("No point features found in KMZ");
+      setRawData(rows); setCleanData(rows);
+      setRemapCols([]); setRemapRules({}); setExpandedRemapCol(null);
+      setSplitRules([{ sourceCol: "TEXT_CONTENT", suffixCol: "NODE_ID" }]);
+      // Auto-assign rule groups using FOLDER column with generic keywords
+      // POI name check takes priority, then folder-based rules
+      // MPOLE is always the fallback — not a rule group condition
+      const groups = [
+        { block: "CLOSURE", conditions: [{ col: "TEXT_CONTENT", op: "contains", val: "POI"  }] },
+        { block: "NAP16",   conditions: [{ col: "FOLDER",       op: "contains", val: "NAP"  }] },
+        { block: "LCPNAP",  conditions: [{ col: "FOLDER",       op: "contains", val: "LCP"  }] },
+      ];
+      setRuleGroups(groups);
+      setAttrMaps({});
+      initializedBlocks.current = new Set();
+      setExpandedAttrBlock(null); setExpandedAttrTransform(null);
+      setStep(1);
+    } catch (e) {
+      setParseError(e.message || "Failed to parse KMZ");
+    }
+    setLoading(false);
+  };
+
+  // ── Clean: live preview with remap + split ──
+  const previewData = useMemo(() => {
+    let data = rawData.map(row => ({ ...row }));
+    // Value remap
+    data = data.map(row => {
+      const r = { ...row };
+      remapCols.forEach(col => {
+        const rule = (remapRules[col] || {})[r[col] ?? ""];
+        if (rule && rule.action !== "keep" && rule.custom !== "") r[col] = rule.custom;
+      });
+      return r;
+    });
+    // Dash split
+    const splitHeaders = [...HEADERS];
+    splitRules.forEach(rule => {
+      if (rule.suffixCol && !splitHeaders.includes(rule.suffixCol)) splitHeaders.push(rule.suffixCol);
+    });
+    data = data.map(row => {
+      const r = { ...row };
+      splitRules.forEach(rule => {
+        if (!rule.sourceCol || !rule.suffixCol) return;
+        const val      = r[rule.sourceCol] ?? "";
+        const lastDash = val.lastIndexOf("-");
+        const suffix   = lastDash >= 0 ? val.substring(lastDash + 1) : "";
+        if (/^N\d+$/i.test(suffix)) {
+          r[rule.suffixCol]  = suffix.toUpperCase();
+          r[rule.sourceCol]  = val.substring(0, lastDash);
+        } else {
+          r[rule.suffixCol]  = "";
+        }
+      });
+      return r;
+    });
+    return { data, headers: splitHeaders };
+  }, [rawData, remapCols, remapRules, splitRules]);
+
+  const applyClean = () => {
+    setCleanData(previewData.data);
+    setStats({ remaining: previewData.data.length, removedRows: rawData.length - previewData.data.length });
+    setStep(2);
+  };
+
+  // ── Configure ──
+  const activeHeaders = previewData.headers;
+  const addGroup      = () => setRuleGroups(g => [...g, newGroup()]);
+  const removeGroup   = gi => setRuleGroups(g => g.filter((_, i) => i !== gi));
+  const updateGroupBlock = (gi, val) => setRuleGroups(g => g.map((grp, i) => {
+    if (i !== gi) return grp;
+    // Switching to CLOSURE always resets condition to TEXT_CONTENT contains POI
+    if (val === "CLOSURE") return { ...grp, block: val, conditions: [{ col: "TEXT_CONTENT", op: "contains", val: "POI" }] };
+    return { ...grp, block: val };
+  }));
+  const addCondition     = gi => setRuleGroups(g => g.map((grp, i) => i === gi ? { ...grp, conditions: [...grp.conditions, newCondition()] } : grp));
+  const removeCondition  = (gi, ci) => setRuleGroups(g => g.map((grp, i) => i === gi ? { ...grp, conditions: grp.conditions.filter((_, j) => j !== ci) } : grp));
+  const updateCondition  = (gi, ci, field, val) => setRuleGroups(g => g.map((grp, i) => i === gi ? { ...grp, conditions: grp.conditions.map((c, j) => j === ci ? { ...c, [field]: val } : c) } : grp));
+
+  // ── Attributes ──
+  const allBlockNames = useMemo(() => {
+    const names = new Set(ruleGroups.map(g => g.block).filter(Boolean));
+    if (fallback.trim()) names.add(fallback.trim());
+    return [...names];
+  }, [ruleGroups, fallback]);
+
+  useEffect(() => {
+    const newBlocks = allBlockNames.filter(n => !initializedBlocks.current.has(n));
+    if (newBlocks.length === 0) return;
+    setAttrMaps(prev => {
+      const updated = { ...prev };
+      newBlocks.forEach(name => {
+        if (!Array.isArray(updated[name])) {
+          const defs = ODN_ATTR_DEFS[name] || [];
+          updated[name] = defs.map(d => ({
+            tag: d.tag,
+            col: "",
+            transforms: {},
+            ...(d.fixedVal !== undefined ? { fixedVal: d.fixedVal } : {})
+          }));
+        }
+        initializedBlocks.current.add(name);
+      });
+      return updated;
+    });
+  }, [allBlockNames]);
+
+  const syncedAttrMaps = useMemo(() => {
+    const updated = { ...attrMaps };
+    allBlockNames.forEach(name => { if (!Array.isArray(updated[name])) updated[name] = []; });
+    return updated;
+  }, [allBlockNames, attrMaps]);
+
+  const addAttr    = bn => setAttrMaps(m => ({ ...m, [bn]: [...(Array.isArray(m[bn]) ? m[bn] : []), newAttr()] }));
+  const removeAttr = (bn, ai) => setAttrMaps(m => ({ ...m, [bn]: (Array.isArray(m[bn]) ? m[bn] : []).filter((_, i) => i !== ai) }));
+  const updateAttr = (bn, ai, field, val) => setAttrMaps(m => ({ ...m, [bn]: (Array.isArray(m[bn]) ? m[bn] : []).map((a, i) => i === ai ? { ...a, [field]: val, ...(field === "col" ? { transforms: {} } : {}) } : a) }));
+  const updateAttrTransforms = (bn, ai, transforms) => setAttrMaps(m => ({ ...m, [bn]: m[bn].map((a, i) => i === ai ? { ...a, transforms } : a) }));
+
+  // ── Generate ──
+  const generate = () => {
+    const result = generateLISP(cleanData, "LONGITUDE", "LATITUDE", ruleGroups, fallback, syncedAttrMaps, true, "csv-insert-odn", "odn_blocks.lsp");
+    setScriptOutput(result.lisp);
+    setStats(s => ({ ...s, matched: result.matched, fallbackCount: result.fallbackCount, total: result.total }));
+    setStep(4);
+  };
+
+  const download = () => {
+    const blob = new Blob([scriptOutput], { type: "text/plain" });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement("a"); a.href = url; a.download = "odn_blocks.lsp"; a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const { data: livePreview, headers: previewHeaders } = previewData;
+
+  return (
+    <div>
+      {/* Step indicators */}
+      <div style={{ display: "flex", gap: 6, marginBottom: "1.5rem", flexWrap: "wrap" }}>
+        {ODN_STEPS_LOCAL.map((s, i) => (
+          <button key={s} className={`step-btn ${step === i ? "active" : step > i ? "done" : ""}`}
+            style={step === i ? { borderColor: ac, color: ac, background: ac + "18" } : {}}
+            onClick={() => step > i && setStep(i)}>
+            {step > i ? <i className="ti ti-check" style={{ fontSize: 11, marginRight: 4 }}></i> : <span style={{ opacity: 0.5, marginRight: 4 }}>{i + 1}.</span>}
+            {s}
+          </button>
+        ))}
+      </div>
+
+      {/* STEP 0: UPLOAD */}
+      {step === 0 && (
+        <div className="card">
+          <div className={`drop-zone ${dragOver ? "over" : ""}`}
+            style={dragOver ? { borderColor: ac } : {}}
+            onClick={() => fileRef.current.click()}
+            onDragOver={e => { e.preventDefault(); setDragOver(true); }}
+            onDragLeave={() => setDragOver(false)}
+            onDrop={e => { e.preventDefault(); setDragOver(false); handleFile(e.dataTransfer.files[0]); }}>
+            <i className="ti ti-map-pin" style={{ fontSize: 32, color: "var(--color-text-secondary)", display: "block", marginBottom: 12 }}></i>
+            <p style={{ fontSize: 14, color: "var(--color-text-secondary)", margin: 0, fontFamily: "'IBM Plex Sans',sans-serif" }}>
+              Drop your <strong>.kmz</strong> file here or <span style={{ color: ac, fontWeight: 500 }}>click to browse</span>
+            </p>
+            <p style={{ fontSize: 12, color: "var(--color-text-secondary)", margin: "6px 0 0", opacity: 0.7, fontFamily: "'IBM Plex Sans',sans-serif" }}>
+              Point features (NAP, LCP, POI) will be extracted. Lines are ignored.
+            </p>
+          </div>
+          {loading && <p style={{ fontSize: 13, color: ac, marginTop: 12, fontFamily: "'IBM Plex Sans',sans-serif" }}>Parsing KMZ...</p>}
+          {parseError && <p style={{ fontSize: 13, color: "#E24B4A", marginTop: 12, fontFamily: "'IBM Plex Sans',sans-serif" }}>{parseError}</p>}
+          <input ref={fileRef} type="file" accept=".kmz" style={{ display: "none" }} onChange={e => handleFile(e.target.files[0])} />
+        </div>
+      )}
+
+      {/* STEP 1: CLEAN */}
+      {step === 1 && (
+        <div>
+          {/* Split rules */}
+          <div className="card">
+            <div className="slabel">1A · Split column by last dash</div>
+            <p style={{ fontSize: 12, color: "var(--color-text-secondary)", marginBottom: 12, fontFamily: "'IBM Plex Sans',sans-serif" }}>
+              Splits at the last <code style={{ background: "var(--color-background-secondary)", padding: "1px 5px", borderRadius: 3 }}>-</code> only when the suffix matches <code style={{ background: "var(--color-background-secondary)", padding: "1px 5px", borderRadius: 3 }}>N</code> + digits. Pre-configured for <code style={{ background: "var(--color-background-secondary)", padding: "1px 5px", borderRadius: 3 }}>TEXT_CONTENT → NODE_ID</code>.
+            </p>
+            {splitRules.map((rule, ri) => (
+              <div key={ri} style={{ display: "grid", gridTemplateColumns: "1fr 24px 1fr 28px", gap: 8, alignItems: "center", marginBottom: 8 }}>
+                <select value={rule.sourceCol} onChange={e => setSplitRules(s => s.map((r, i) => i === ri ? { ...r, sourceCol: e.target.value } : r))} style={{ fontSize: 12, padding: "5px 8px" }}>
+                  <option value="">-- source column --</option>
+                  {HEADERS.map(h => <option key={h} value={h}>{h}</option>)}
+                </select>
+                <span style={{ fontSize: 12, color: "var(--color-text-secondary)", textAlign: "center" }}>→</span>
+                <input type="text" placeholder="New column name (e.g. NODE_ID)" value={rule.suffixCol}
+                  onChange={e => setSplitRules(s => s.map((r, i) => i === ri ? { ...r, suffixCol: e.target.value } : r))}
+                  style={{ fontSize: 12, padding: "5px 8px" }} />
+                <button className="del-btn" onClick={() => setSplitRules(s => s.filter((_, i) => i !== ri))}><i className="ti ti-x"></i></button>
+              </div>
+            ))}
+            <button className="btn-ghost" onClick={() => setSplitRules(s => [...s, { sourceCol: "", suffixCol: "" }])}>
+              <i className="ti ti-plus" style={{ fontSize: 11, marginRight: 4 }}></i>Add split rule
+            </button>
+          </div>
+
+          {/* Value remap */}
+          <div className="card">
+            <div className="slabel">1B · Clean column values</div>
+            <p style={{ fontSize: 12, color: "var(--color-text-secondary)", marginBottom: 12, fontFamily: "'IBM Plex Sans',sans-serif" }}>Select columns to inspect and remap individual values.</p>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 14 }}>
+              {HEADERS.map(h => (
+                <span key={h} className={`tag ${remapCols.includes(h) ? "sel-blue" : ""}`}
+                  onClick={() => { setRemapCols(d => d.includes(h) ? d.filter(x => x !== h) : [...d, h]); if (!remapCols.includes(h)) setExpandedRemapCol(h); }}>
+                  {remapCols.includes(h) && <i className="ti ti-pencil" style={{ fontSize: 10 }}></i>}{h}
+                </span>
+              ))}
+            </div>
+            {remapCols.map(col => (
+              <div key={col} style={{ marginBottom: 8 }}>
+                <div className={`remap-row ${expandedRemapCol === col ? "exp" : ""}`} onClick={() => setExpandedRemapCol(expandedRemapCol === col ? null : col)}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <span className="badge-blue">{col}</span>
+                    <span style={{ fontSize: 12, color: "var(--color-text-secondary)", fontFamily: "'IBM Plex Sans',sans-serif" }}>{[...new Set(rawData.map(r => r[col]))].length} unique values</span>
+                  </div>
+                  <i className={`ti ti-chevron-${expandedRemapCol === col ? "up" : "down"}`} style={{ fontSize: 13, color: "var(--color-text-secondary)" }}></i>
+                </div>
+                {expandedRemapCol === col && (
+                  <div className="card-inner">
+                    <ValueRemapper col={col} data={rawData} remapRules={remapRules[col] || {}} onChange={rules => setRemapRules(r => ({ ...r, [col]: rules }))} />
+                  </div>
+                )}
+              </div>
+            ))}
+            {remapCols.length === 0 && <p style={{ fontSize: 12, color: "var(--color-text-secondary)", margin: 0, opacity: 0.7, fontFamily: "'IBM Plex Sans',sans-serif" }}>No columns selected.</p>}
+          </div>
+
+          {/* Live preview */}
+          <div className="card">
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+              <div className="slabel" style={{ margin: 0 }}>1C · Preview after cleaning</div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <span className="badge-teal">{livePreview.length} rows</span>
+                <span className="badge-amber">{rawData.length - livePreview.length} removed</span>
+              </div>
+            </div>
+            <div style={{ overflowX: "auto" }}>
+              <table className="preview-table">
+                <thead><tr>{previewHeaders.map(h => <th key={h}>{h}</th>)}</tr></thead>
+                <tbody>
+                  {livePreview.slice(0, 8).map((row, i) => (
+                    <tr key={i}>{previewHeaders.map(h => <td key={h} title={row[h]}>{row[h]}</td>)}</tr>
+                  ))}
+                </tbody>
+              </table>
+              {livePreview.length > 8 && <p style={{ fontSize: 11, color: "var(--color-text-secondary)", margin: "8px 0 0", fontFamily: "'IBM Plex Sans',sans-serif" }}>Showing 8 of {livePreview.length} rows</p>}
+            </div>
+          </div>
+
+          <div style={{ display: "flex", gap: 8 }}>
+            <button className="action-btn btn-primary" onClick={applyClean} style={{ background: ac }}>Apply cleaning →</button>
+            <button className="action-btn btn-secondary" onClick={() => setStep(0)}>← Back</button>
+          </div>
+        </div>
+      )}
+
+      {/* STEP 2: CONFIGURE */}
+      {step === 2 && (
+        <div>
+          {stats && (
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: 10, marginBottom: "1rem" }}>
+              <div className="stat-card"><div className="stat-val">{stats.remaining}</div><div className="stat-lbl">Rows remaining</div></div>
+              <div className="stat-card"><div className="stat-val">{stats.removedRows}</div><div className="stat-lbl">Rows removed</div></div>
+            </div>
+          )}
+          <div className="card" style={{ background: "var(--color-background-secondary)", border: "none", marginBottom: "1rem" }}>
+            <p style={{ fontSize: 12, color: "var(--color-text-secondary)", margin: 0, fontFamily: "'IBM Plex Sans',sans-serif" }}>
+              <i className="ti ti-info-circle" style={{ fontSize: 13, verticalAlign: -2, marginRight: 6 }}></i>
+              Rule groups have been auto-configured from your KMZ folders. POI → CLOSURE takes priority. Review and adjust as needed.
+            </p>
+          </div>
+
+          <div className="card">
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+              <div>
+                <div className="slabel" style={{ marginBottom: 2 }}>Rule groups</div>
+                <p style={{ fontSize: 12, color: "var(--color-text-secondary)", margin: 0, fontFamily: "'IBM Plex Sans',sans-serif" }}>First match wins. All conditions in a group must match (AND logic).</p>
+              </div>
+            </div>
+            {ruleGroups.map((grp, gi) => (
+              <div key={gi} className="rule-group">
+                <div className="rg-header">
+                  <span className="grp-num">Group {gi + 1}</span>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, flex: 1 }}>
+                    <span style={{ fontSize: 11, color: "var(--color-text-secondary)", whiteSpace: "nowrap", fontFamily: "'IBM Plex Sans',sans-serif" }}>→ Block:</span>
+                    <select value={grp.block} onChange={e => updateGroupBlock(gi, e.target.value)} style={{ maxWidth: 200, fontSize: 12, padding: "5px 8px" }}>
+                      <option value="">-- select block --</option>
+                      {ODN_BLOCKS.map(b => <option key={b} value={b}>{b}</option>)}
+                    </select>
+                  </div>
+                  {ruleGroups.length > 1 && <button className="del-btn" onClick={() => removeGroup(gi)}><i className="ti ti-trash" style={{ fontSize: 14 }}></i></button>}
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 110px 1fr 28px", gap: 6, marginBottom: 6 }}>
+                  {["Column", "Op", "Value", ""].map((h, i) => <span key={i} style={{ fontSize: 11, color: "var(--color-text-secondary)", fontFamily: "'IBM Plex Sans',sans-serif" }}>{h}</span>)}
+                </div>
+                {grp.conditions.map((cond, ci) => (
+                  <div key={ci}>
+                    {ci > 0 && <div className="and-badge">AND</div>}
+                    <div className="cond-row" style={{ gridTemplateColumns: "1fr 110px 1fr 28px" }}>
+                      <select value={cond.col} onChange={e => updateCondition(gi, ci, "col", e.target.value)}>
+                        <option value="">-- column --</option>
+                        {activeHeaders.map(h => <option key={h} value={h}>{h}</option>)}
+                      </select>
+                      <select value={cond.op} onChange={e => updateCondition(gi, ci, "op", e.target.value)}>
+                        {OPERATORS.map(o => <option key={o} value={o}>{o}</option>)}
+                      </select>
+                      {cond.col && cleanData.length > 0 ? (() => {
+                        const uniq = [...new Set(cleanData.map(r => r[cond.col] ?? "").filter(v => v !== ""))].sort();
+                        return uniq.length <= 50 ? (
+                          <select value={cond.val} onChange={e => updateCondition(gi, ci, "val", e.target.value)}>
+                            <option value="">-- pick value --</option>
+                            {uniq.map(v => <option key={v} value={v}>{v}</option>)}
+                          </select>
+                        ) : <input type="text" placeholder="value" value={cond.val} onChange={e => updateCondition(gi, ci, "val", e.target.value)} />;
+                      })() : <input type="text" placeholder="value" value={cond.val} onChange={e => updateCondition(gi, ci, "val", e.target.value)} />}
+                      <button className="del-btn" onClick={() => removeCondition(gi, ci)} disabled={grp.conditions.length === 1} style={{ opacity: grp.conditions.length === 1 ? 0.3 : 1 }}><i className="ti ti-x"></i></button>
+                    </div>
+                  </div>
+                ))}
+                <button className="btn-ghost" onClick={() => addCondition(gi)} style={{ marginTop: 4 }}>
+                  <i className="ti ti-plus" style={{ fontSize: 11, marginRight: 4 }}></i>Add condition
+                </button>
+              </div>
+            ))}
+            <button className="action-btn btn-secondary" onClick={addGroup} style={{ fontSize: 12, padding: "7px 16px", width: "100%", marginTop: 4 }}>
+              <i className="ti ti-plus" style={{ fontSize: 12, marginRight: 6 }}></i>Add rule group
+            </button>
+            <div style={{ marginTop: 16, borderTop: "0.5px solid var(--color-border-tertiary)", paddingTop: 14 }}>
+              <label style={{ fontSize: 12, color: "var(--color-text-secondary)", display: "block", marginBottom: 6, fontFamily: "'IBM Plex Sans',sans-serif" }}>Fallback block (no match)</label>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span style={{ fontSize: 13, fontFamily: "'IBM Plex Mono',monospace", padding: "6px 12px", background: "var(--color-background-secondary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-md)", color: "var(--color-text-primary)" }}>MPOLE</span>
+                <span style={{ fontSize: 11, color: "var(--color-text-secondary)", fontFamily: "'IBM Plex Sans',sans-serif" }}>Always used when no rule matches</span>
+              </div>
+            </div>
+          </div>
+
+          <div style={{ display: "flex", gap: 8 }}>
+            <button className="action-btn btn-primary" onClick={() => setStep(3)} style={{ background: ac }}>Configure attributes →</button>
+            <button className="action-btn btn-secondary" onClick={() => setStep(1)}>← Back</button>
+          </div>
+        </div>
+      )}
+
+      {/* STEP 3: ATTRIBUTES */}
+      {step === 3 && (
+        <div>
+          <div className="card" style={{ background: "var(--color-background-secondary)", border: "none", marginBottom: "1rem" }}>
+            <p style={{ fontSize: 12, color: "var(--color-text-secondary)", margin: 0, fontFamily: "'IBM Plex Sans',sans-serif", lineHeight: 1.7 }}>
+              <i className="ti ti-info-circle" style={{ fontSize: 13, verticalAlign: -2, marginRight: 6 }}></i>
+              Attribute tags are pre-filled per block type. Pick the source column for each. All values written uppercase. CLOSURE has no attributes.
+            </p>
+          </div>
+          {allBlockNames.length === 0 && <div className="card"><p style={{ fontSize: 13, color: "var(--color-text-secondary)", margin: 0, fontFamily: "'IBM Plex Sans',sans-serif" }}>No block names defined. Go back to Configure.</p></div>}
+          {allBlockNames.map(blockName => {
+            const attrs     = syncedAttrMaps[blockName] || [];
+            const isExpanded = expandedAttrBlock === blockName;
+            return (
+              <div key={blockName} className="block-card">
+                <div className="block-card-header" onClick={() => setExpandedAttrBlock(isExpanded ? null : blockName)}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                    <span className="badge-purple">{blockName}</span>
+                    <span style={{ fontSize: 12, color: "var(--color-text-secondary)", fontFamily: "'IBM Plex Sans',sans-serif" }}>
+                      {blockName === "CLOSURE" ? "No attributes" : attrs.length === 0 ? "No attributes defined" : `${attrs.length} attribute${attrs.length > 1 ? "s" : ""}`}
+                    </span>
+                  </div>
+                  <i className={`ti ti-chevron-${isExpanded ? "up" : "down"}`} style={{ fontSize: 13, color: "var(--color-text-secondary)" }}></i>
+                </div>
+                {isExpanded && (
+                  <div className="block-card-body">
+                    {blockName === "CLOSURE" ? (
+                      <p style={{ fontSize: 12, color: "var(--color-text-secondary)", margin: 0, fontFamily: "'IBM Plex Sans',sans-serif" }}>No attributes needed for CLOSURE blocks.</p>
+                    ) : (
+                      <>
+                        {attrs.length > 0 && (
+                          <div style={{ display: "grid", gridTemplateColumns: "130px 1fr 28px", gap: 8, marginBottom: 6 }}>
+                            {["Attribute tag", "Source column", ""].map((h, i) => <span key={i} style={{ fontSize: 11, color: "var(--color-text-secondary)", fontFamily: "'IBM Plex Sans',sans-serif" }}>{h}</span>)}
+                          </div>
+                        )}
+                        {attrs.map((attr, ai) => {
+                          const tk      = `${blockName}:${ai}`;
+                          const isTO    = expandedAttrTransform === tk;
+                          const tc      = Object.values(attr.transforms || {}).filter(t => t.to && t.to !== "").length;
+                          const isFixed = attr.fixedVal !== undefined;
+                          return (
+                            <div key={ai} style={{ marginBottom: 14, paddingBottom: 14, borderBottom: ai < attrs.length - 1 ? "0.5px solid var(--color-border-tertiary)" : "none" }}>
+                              <div className="attr-row">
+                                <input type="text" placeholder="TAG_NAME" value={attr.tag} onChange={e => updateAttr(blockName, ai, "tag", e.target.value.toUpperCase())} style={{ textTransform: "uppercase" }} readOnly={isFixed} />
+                                {isFixed ? (
+                                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                                    <span style={{ fontSize: 13, fontFamily: "'IBM Plex Mono',monospace", padding: "5px 10px", background: "var(--color-background-secondary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-md)", color: "var(--color-text-primary)" }}>{String(attr.fixedVal).toUpperCase()}</span>
+                                    <span style={{ fontSize: 11, color: "var(--color-text-secondary)", fontFamily: "'IBM Plex Sans',sans-serif" }}>fixed value</span>
+                                  </div>
+                                ) : (
+                                  <select value={attr.col} onChange={e => updateAttr(blockName, ai, "col", e.target.value)}>
+                                    <option value="">-- source column --</option>
+                                    {activeHeaders.map(h => <option key={h} value={h}>{h}</option>)}
+                                  </select>
+                                )}
+                                <button className="del-btn" onClick={() => removeAttr(blockName, ai)} disabled={isFixed} style={{ opacity: isFixed ? 0.3 : 1 }}><i className="ti ti-x"></i></button>
+                              </div>
+                              {!isFixed && attr.col && (
+                                <div>
+                                  <button className="transform-toggle" onClick={() => setExpandedAttrTransform(isTO ? null : tk)}>
+                                    <i className={`ti ti-${isTO ? "chevron-up" : "adjustments-horizontal"}`} style={{ fontSize: 12 }}></i>
+                                    {isTO ? "Hide transforms" : (tc > 0 ? `Value transforms (${tc} active)` : "Value transforms")}
+                                  </button>
+                                  {isTO && (
+                                    <div className="card-inner" style={{ marginTop: 8 }}>
+                                      <AttrTransformEditor col={attr.col} cleanData={cleanData} transforms={attr.transforms || {}} onChange={t => updateAttrTransforms(blockName, ai, t)} />
+                                    </div>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                        <button className="btn-ghost" onClick={() => addAttr(blockName)} style={{ width: "100%" }}>
+                          <i className="ti ti-plus" style={{ fontSize: 11, marginRight: 4 }}></i>Add attribute
+                        </button>
+                      </>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+          <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+            <button className="action-btn btn-primary" onClick={generate} style={{ background: ac }}>Generate .lsp file →</button>
+            <button className="action-btn btn-secondary" onClick={() => setStep(2)}>← Back</button>
+          </div>
+        </div>
+      )}
+
+      {/* STEP 4: GENERATE */}
+      {step === 4 && (
+        <div>
+          {stats && (
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: 10, marginBottom: "1rem" }}>
+              <div className="stat-card"><div className="stat-val">{stats.total}</div><div className="stat-lbl">Total inserts</div></div>
+              <div className="stat-card"><div className="stat-val" style={{ color: ac }}>{stats.matched}</div><div className="stat-lbl">Rule matched</div></div>
+              <div className="stat-card"><div className="stat-val">{stats.fallbackCount}</div><div className="stat-lbl">Fallback used</div></div>
+            </div>
+          )}
+          <div className="card">
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+              <div className="slabel" style={{ margin: 0 }}>LISP preview</div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <span className="badge-purple">.lsp format</span>
+                <span className="badge-amber">{scriptOutput.split("\n").length} lines</span>
+              </div>
+            </div>
+            <div className="script-out">
+              {scriptOutput.split("\n").slice(0, 60).join("\n")}
+              {scriptOutput.split("\n").length > 60 ? `\n\n... and ${scriptOutput.split("\n").length - 60} more lines` : ""}
+            </div>
+          </div>
+          <div className="card" style={{ background: "var(--color-background-secondary)", border: "none" }}>
+            <div className="slabel">How to use in AutoCAD</div>
+            <p style={{ fontSize: 12, color: "var(--color-text-secondary)", margin: 0, fontFamily: "'IBM Plex Sans',sans-serif", lineHeight: 1.9 }}>
+              1. Ensure NAP16, LCPNAP, MPOLE, CLOSURE blocks exist in the drawing<br />
+              2. Type <code style={{ background: "var(--color-background-primary)", padding: "1px 5px", borderRadius: 3 }}>APPLOAD</code> and load <code style={{ background: "var(--color-background-primary)", padding: "1px 5px", borderRadius: 3 }}>odn_blocks.lsp</code><br />
+              3. Blocks insert automatically at their coordinates with attributes filled<br />
+              4. Re-run with <code style={{ background: "var(--color-background-primary)", padding: "1px 5px", borderRadius: 3 }}>(csv-insert-odn)</code>
+            </p>
+          </div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button className="action-btn btn-primary" onClick={download} style={{ background: ac }}>
+              <i className="ti ti-download" style={{ fontSize: 13, marginRight: 6 }}></i>Download odn_blocks.lsp
+            </button>
+            <button className="action-btn btn-secondary" onClick={() => setStep(3)}>← Edit attributes</button>
+            <button className="action-btn btn-secondary" onClick={() => { setStep(0); setRawData([]); setCleanData([]); setScriptOutput(""); setStats(null); }}>Start over</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Root App ──────────────────────────────────────────────────────────────────
 export default function App() {
   const [activeTab, setActiveTab] = useState("backbone");
@@ -1030,25 +1656,7 @@ export default function App() {
 
       {/* ODN Plotter */}
       {activeTab === "odn" && (
-        <Plotter
-          key="odn"
-          accentColor="#7C3AED"
-          label="ODN Plotter"
-          steps={ODN_STEPS}
-          useUTM={false}
-          xLabel="X Coordinate"
-          yLabel="Y Coordinate"
-          xAutoDetect={/x.coord|x_coord|x$/i}
-          yAutoDetect={/y.coord|y_coord|y$/i}
-          showDeleteCols={false}
-          showDedup={false}
-          showRemapOnly={true}
-          showSplit={true}
-          blockChoices={[]}
-          prefilledAttrTags={[]}
-          fnName="csv-insert-odn"
-          downloadName="odn_blocks.lsp"
-        />
+        <ODNPlotter key="odn" accentColor="#7C3AED" />
       )}
     </div>
   );
